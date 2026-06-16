@@ -1,0 +1,12 @@
+{
+    "display_name": "El Gabinete",
+    "loading_order": 11,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "styles.css",
+    "author": "botxc",
+    "version": "1.0.0",
+    "homePage": "",
+    "description": "Sistema de terapeuta con dossier de pacientes procedural. Genera perfiles, rastrea sesiones y desbloquea nuevas categorías según la reputación acumulada."
+}
