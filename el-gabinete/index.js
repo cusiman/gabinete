@@ -4,8 +4,9 @@
  * v1.0.0
  */
 
-import { extension_settings, getContext } from '../../../../extensions.js';
-import * as script from '../../../../../script.js';
+import { extension_settings, getContext } from '../../../extensions.js';
+import { eventSource, event_types, saveSettingsDebounced, saveChatDebounced } from '../../../../script.js';
+import * as script from '../../../../script.js';
 
 const EXT_ID = 'gabinete';
 const VERSION = '1.0.0';
@@ -95,15 +96,15 @@ function isUnlocked(id) {
 // ═══════════════════════════════════════════════════════════════
 
 const CATEGORIAS = [
-    { id: 'estudiante', label: 'Estudiante', unlock: 'estudiantes',
-      edadMin: 18, edadMax: 25,
-      hint: 'Universitaria o recién graduada. Crisis académica, identitaria o familiar.' },
-    { id: 'madre_familiar', label: 'Madre / Familiar', unlock: 'madres',
-      edadMin: 28, edadMax: 48,
-      hint: 'Remitida por el centro educativo de un hijo o familiar. Carga emocional acumulada.' },
-    { id: 'vip', label: 'VIP / Figura Pública', unlock: 'vip',
+    { id: 'estudiante', label: 'Estudiantes', unlock: 'estudiantes',
+      edadMin: 18, edadMax: 26,
+      hint: 'Universitarias o recién graduadas. Crisis académica, identitaria o familiar.' },
+    { id: 'madre_familiar', label: 'Madres / Familiares', unlock: 'madres',
+      edadMin: 28, edadMax: 50,
+      hint: 'Madres, tutoras o familiares remitidas por el centro o por sus propias crisis.' },
+    { id: 'vip', label: 'Clientela VIP', unlock: 'vip',
       edadMin: 22, edadMax: 45,
-      hint: 'Influencer, modelo, ejecutiva o personalidad mediática. Imagen pública vs. vida privada.' },
+      hint: 'Influencers, modelos, ejecutivas. Imagen pública vs. vida privada.' },
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -235,23 +236,31 @@ Postura inicial: ${p.postura}`;
 function extraerEstadoPaciente(texto) {
     const updates = {};
 
-    const progressMatch = texto.match(/\*\*Progreso de la Carrera:\*\*\s*(\d+)%/i);
+    // Acepta: "**Progreso de la Carrera:** 18%" o "Progreso de la Carrera: 18%"
+    const progressMatch = texto.match(/Progreso de la Carrera[^:]*:\*?\*?\s*(\d+)%/i);
     if (progressMatch) updates.progresoCarrera = parseInt(progressMatch[1]);
 
-    const depMatch = texto.match(/\*\*Dependencia del Agente:\*\*\s*(\d+)%/i);
+    const depMatch = texto.match(/Dependencia del Agente[^:]*:\*?\*?\s*(\d+)%/i);
     if (depMatch) updates.dependencia = parseInt(depMatch[1]);
 
-    // Resistencia: inferir del pudor si no hay campo directo
-    const pudorMatch = texto.match(/Umbral de Pudor[^:]*:\s*([^\n|]+)/i);
+    // También capturar Atadura (para Azrael) y otros formatos
+    const ataduraMatch = texto.match(/Atadura a Azrael[^:]*:\*?\*?\s*(\d+)%/i);
+    if (ataduraMatch) updates.dependencia = parseInt(ataduraMatch[1]);
+
+    const soñoMatch = texto.match(/Progreso del Sue[ñn]o[^:]*:\*?\*?\s*(\d+)%/i);
+    if (soñoMatch) updates.progresoCarrera = parseInt(soñoMatch[1]);
+
+    // Umbral de pudor → inferir resistencia
+    const pudorMatch = texto.match(/Umbral de Pudor[^:\|]*[\:\|]\s*([^\n\|\*]+)/i);
     if (pudorMatch) {
         const pudor = pudorMatch[1].trim().toLowerCase();
-        if (pudor.includes('roto')) updates.resistencia = Math.max(0, (updates.resistencia || 50) - 20);
-        else if (pudor.includes('vacil')) updates.resistencia = 40;
-        else if (pudor.includes('estricto')) updates.resistencia = 80;
+        if (pudor.includes('roto')) updates.resistencia = 15;
+        else if (pudor.includes('vacil')) updates.resistencia = 45;
+        else if (pudor.includes('estricto')) updates.resistencia = 85;
     }
 
-    // Nombre de la paciente si aparece en la ficha
-    const nombreMatch = texto.match(/(?:\*\*)?Nombre y Edad(?:\*\*)?:\s*([^,\n]+)/i);
+    // Nombre detectado en la ficha
+    const nombreMatch = texto.match(/(?:Nombre y Edad|Nombre)[^:\n]*[:\-–—]\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)/);
     if (nombreMatch) updates.nombreDetectado = nombreMatch[1].trim();
 
     return updates;
@@ -260,6 +269,18 @@ function extraerEstadoPaciente(texto) {
 // ═══════════════════════════════════════════════════════════════
 // CREAR / ACTUALIZAR PACIENTE
 // ═══════════════════════════════════════════════════════════════
+
+function determinarCategoria(edad, texto) {
+    const t = texto.toLowerCase();
+    // Indicadores explícitos
+    if (t.includes('madre') || t.includes('familiar') || t.includes('tutora') ||
+        t.includes('hijo') || t.includes('hija')) return 'madre_familiar';
+    if (t.includes('influencer') || t.includes('modelo') || t.includes('ejecutiva') ||
+        t.includes('vip') || t.includes('celebridad') || t.includes('actriz')) return 'vip';
+    // Por edad
+    if (edad >= 28) return 'madre_familiar';
+    return 'estudiante';
+}
 
 function nuevaPaciente(datos) {
     const settings = getSettings();
@@ -767,24 +788,44 @@ function switchTab(tabId) {
 // ═══════════════════════════════════════════════════════════════
 
 function onMessageReceived(data) {
-    const texto = data?.mes || data?.content || '';
+    // ST puede pasar el objeto mensaje o solo el índice — extraer texto de ambas formas
+    let texto = '';
+    if (typeof data === 'string') {
+        texto = data;
+    } else if (data?.mes) {
+        texto = data.mes;
+    } else if (data?.message) {
+        texto = data.message;
+    } else {
+        // Fallback: leer el último mensaje del chat directamente
+        texto = getLastAssistantMessage();
+    }
     if (!texto) return;
 
-    // Intentar detectar ficha de nueva paciente
-    if (texto.includes('[FICHA DE LA ASPIRANTE') || texto.includes('FICHA DE LA CANDIDATA')) {
-        const nombreM = texto.match(/Nombre y Edad[^:]*:\s*([^,\n]+)/i);
-        const edadM = texto.match(/Nombre y Edad[^:]*:[^,]*,\s*(\d+)/i);
-        const psicM = texto.match(/Psicología Base[^:]*:\s*([^\n.]+)/i);
-        const posturaM = texto.match(/Postura de Entrada[^:]*:\s*([^\n.]+)/i);
-        const motivoM = texto.match(/(?:Ambición|Crisis)[^:]*:\s*([^\n]+)/i);
+    // Intentar detectar ficha de nueva paciente — formato flexible
+    const tieneFicha = texto.includes('FICHA DE LA ASPIRANTE') ||
+                       texto.includes('FICHA DE LA CANDIDATA') ||
+                       texto.includes('FICHA DE LA CAMPEONA');
+
+    if (tieneFicha) {
+        // Nombre — acepta: "Aurora (28 años)", "Aurora, 28", "Aurora — 28 años"
+        const nombreM = texto.match(/(?:Nombre y Edad|Nombre)[^:\n]*[:\-–—]\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?)/);
+        // Edad — buscar número entre 18 y 55 cerca del nombre
+        const edadM = texto.match(/(?:Nombre y Edad)[^\n]*?(\d{2})\s*(?:años|a[ñn])/i)
+                   || texto.match(/\b(1[89]|[2-4]\d|5[0-5])\s*años/i);
+        const psicM = texto.match(/(?:Psicolog[ií]a Base)[^:\n]*[:\-–—]\s*([^\n•\-]+)/i);
+        const posturaM = texto.match(/(?:Postura de Entrada)[^:\n]*[:\-–—]\s*([^\n•\-]+)/i);
+        const contratoM = texto.match(/(?:Tipo de Contrato[^:\n]*)[:\-–—]\s*([^\n•\-]+)/i);
+        const motivoM = texto.match(/(?:Sueño de la Carne|Ambici[oó]n|Crisis)[^:\n]*[:\-–—]\s*([^\n]+)/i);
 
         const datos = {
             nombre: nombreM?.[1]?.trim() || 'Desconocida',
             edad: parseInt(edadM?.[1]) || 25,
-            psicologia: psicM?.[1]?.trim() || 'Quebradiza',
-            postura: posturaM?.[1]?.trim() || 'Inexperta',
-            motivoConsulta: motivoM?.[1]?.trim() || '',
-            categoria: 'estudiante',
+            psicologia: psicM?.[1]?.trim().replace(/\s*[\(\[].*/, '') || 'Quebradiza',
+            postura: posturaM?.[1]?.trim().replace(/\s*[\(\[].*/, '') || 'Inexperta',
+            motivoConsulta: contratoM?.[1]?.trim() || motivoM?.[1]?.trim() || '',
+            crisis: motivoM?.[1]?.trim() || '',
+            categoria: determinarCategoria(parseInt(edadM?.[1]) || 25, texto),
         };
 
         nuevaPaciente(datos);
@@ -840,18 +881,29 @@ function onChatChanged() {
     }
 
     // Suscribirse a eventos de SillyTavern
-    const eventSource = window.eventSource || window.SillyTavern?.eventSource;
     if (eventSource) {
-        eventSource.on('message_received', onMessageReceived);
-        eventSource.on('chat_id_changed', onChatChanged);
-        eventSource.on('character_selected', onChatChanged);
+        // Usar nombres string como fallback por si event_types no tiene la key exacta
+        const msgEvent = event_types?.MESSAGE_RECEIVED || 'message_received';
+        const chatEvent = event_types?.CHAT_CHANGED || 'chat_id_changed';
+        const charEvent = event_types?.CHARACTER_SELECTED || 'character_selected';
+
+        eventSource.on(msgEvent, (data) => onMessageReceived(data));
+        eventSource.on(chatEvent, onChatChanged);
+        eventSource.on(charEvent, onChatChanged);
+
+        // También escuchar MESSAGE_SENT por si acaso el modelo responde vía streaming
+        const streamEvent = event_types?.STREAM_TOKEN_RECEIVED || 'stream_token_received';
+        // No suscribir streaming — demasiado frecuente. Solo mensaje completo.
+
+        console.log('[El Gabinete] Eventos registrados:', msgEvent, chatEvent);
     } else {
-        // Fallback: hook en el DOM
+        console.warn('[El Gabinete] eventSource no disponible — usando MutationObserver');
         const observer = new MutationObserver(() => {
-            if (panelOpen) renderDossier();
+            const lastMsg = getLastAssistantMessage();
+            if (lastMsg) onMessageReceived({ mes: lastMsg });
         });
         const chat = document.getElementById('chat');
-        if (chat) observer.observe(chat, { childList: true });
+        if (chat) observer.observe(chat, { childList: true, subtree: false });
     }
 
     console.log(`[El Gabinete] v${VERSION} cargado`);
